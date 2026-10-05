@@ -1,0 +1,29 @@
+# Nginx image serving the built frontend for the Docker deployment.
+#
+# The build stage below is byte-identical to the `frontend-builder` stage in the
+# main Dockerfile, so BuildKit reuses those cached layers instead of running a
+# second `npm ci` from scratch.
+FROM node:18-slim AS frontend-builder
+
+WORKDIR /app/frontend
+
+RUN apt-get update && apt-get install -y \
+    python3 \
+    make \
+    g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY frontend/package*.json ./
+
+RUN npm ci
+
+COPY frontend/ ./
+
+RUN npm run build
+
+FROM nginx:alpine
+
+COPY --from=frontend-builder /app/frontend/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 3000

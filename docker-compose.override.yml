@@ -1,0 +1,115 @@
+# Local additions to docker-compose.yml. Docker Compose loads this file
+# automatically, so `docker compose up -d` still does the right thing.
+#
+# Why this exists: upstream's compose publishes 3000 on the `autoclip`
+# container, but nothing in that container listens on 3000 — the backend runs
+# uvicorn on 8000 and never serves frontend/dist. The `web` service below fills
+# that gap with nginx.
+
+services:
+  autoclip:
+    # !override replaces the upstream list instead of concatenating with it;
+    # without it Compose would keep the dead "3000:3000" binding and clash with
+    # the web service below.
+    ports: !override
+      - "8000:8000"
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    image: autoclip-web:local
+    container_name: autoclip-web
+    restart: unless-stopped
+    # Host 3000 is taken by an unrelated Next.js dev server on this machine,
+    # so the UI is published on 3100 instead. Container-side stays 3000.
+    ports:
+      - "3100:3000"
+    depends_on:
+      autoclip:
+        condition: service_healthy
+
+  # Upstream runs `celery ... flower` inside the app image, but `flower` is not
+  # in requirements.txt, so the command does not exist and the container sits in
+  # a restart loop. The official Flower image already bundles it and only needs
+  # the broker URL.
+  flower:
+    image: mher/flower:2.0
+    build: !reset null
+    entrypoint: !reset null
+    command: celery --broker=redis://redis:6379/0 flower --port=5555
+    environment: !override
+      - FLOWER_UNAUTHENTICATED_API=true
+    depends_on: !override
+      redis:
+        condition: service_healthy
+
+  # These two inherit the Dockerfile's HEALTHCHECK, which curls the API on
+  # :8000. Neither runs a web server, so both are permanently "unhealthy" while
+  # working perfectly. Replace with checks that match what they actually do.
+  celery-worker:
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A backend.core.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  celery-beat:
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'celery.*beat' > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # clip-assist: authenticated adapter in front of AutoClip, for clipferno.
+  #
+  # AutoClip itself has no authentication, so it stays on the internal compose
+  # network only. This is the one service that checks a token, and the only one
+  # that would ever be exposed beyond this machine.
+  #
+  # Shares the ./data bind mount so it reuses the already-installed Whisper
+  # runtime and cached models rather than duplicating 480MB.
+  clip-assist:
+    build:
+      context: ../clip-assist
+      dockerfile: Dockerfile
+    image: clip-assist:local
+    container_name: autoclip-clip-assist
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - ASSIST_API_TOKEN=${ASSIST_API_TOKEN:-}
+      - ASSIST_SUBTITLE_LANGS=${ASSIST_SUBTITLE_LANGS:-en}
+      - ASSIST_WHISPER_MODEL=${ASSIST_WHISPER_MODEL:-base}
+      - ASSIST_MAX_WORKERS=${ASSIST_MAX_WORKERS:-1}
+      - ASSIST_LOG_LEVEL=INFO
+      # The candidates endpoint runs AutoClip's LLM steps in this container, so
+      # it needs the same provider config as the app. Transcripts do not (the
+      # captions path and local Whisper use no LLM), which is why this was not
+      # needed until candidates landed.
+      - LLM_PROVIDER=${LLM_PROVIDER:-dashscope}
+      - API_MODEL_NAME=${API_MODEL_NAME:-qwen-plus}
+      - API_DASHSCOPE_API_KEY=${API_DASHSCOPE_API_KEY:-}
+      - API_OPENAI_API_KEY=${API_OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - API_GEMINI_API_KEY=${API_GEMINI_API_KEY:-}
+      - API_SILICONFLOW_API_KEY=${API_SILICONFLOW_API_KEY:-}
+      # Render uploads finished clips straight to Supabase Storage. A rendered
+      # clip is tens of megabytes, and proxying that through a serverless
+      # function is the wrong shape. Unset = renders stay downloadable from
+      # this service instead.
+      - ASSIST_SUPABASE_URL=${ASSIST_SUPABASE_URL:-}
+      - ASSIST_SUPABASE_SERVICE_KEY=${ASSIST_SUPABASE_SERVICE_KEY:-}
+      - ASSIST_SUPABASE_BUCKET=${ASSIST_SUPABASE_BUCKET:-ai-clips}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8787/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
